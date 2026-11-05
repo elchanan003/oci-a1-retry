@@ -1,0 +1,65 @@
+name: oci-a1-retry
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  issues: write
+  actions: write
+concurrency:
+  group: oci-a1-retry
+  cancel-in-progress: false
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure OCI auth
+        run: |
+          mkdir -p ~/.oci && chmod 700 ~/.oci
+          printf '%s' "${{ secrets.OCI_KEY_B64 }}" | base64 -d > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=il-jerusalem-1
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+      - name: Install OCI CLI
+        run: pip install -q oci-cli
+      - name: Retry launch (9 attempts, ~9 min)
+        id: r
+        env:
+          SUPPRESS_LABEL_WARNING: "True"
+          T: ${{ secrets.OCI_TENANCY }}
+          BV: ${{ secrets.OCI_BOOTVOL }}
+          SUB: ${{ secrets.OCI_SUBNET }}
+        run: |
+          AD="npHA:IL-JERUSALEM-1-AD-1"
+          EXIST=$(oci compute instance list -c "$T" --query "length(data[?\"display-name\"=='free-vm-2' && \"lifecycle-state\"!='TERMINATED'])" --raw-output 2>/dev/null)
+          if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then echo "result=exists" >> "$GITHUB_OUTPUT"; echo "free-vm-2 already exists"; exit 0; fi
+          for i in $(seq 1 9); do
+            OUT=$(oci compute instance launch \
+              --availability-domain "$AD" --compartment-id "$T" \
+              --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
+              --subnet-id "$SUB" --assign-public-ip true --display-name free-vm-2 2>&1 || true)
+            if printf '%s' "$OUT" | grep -q '"id": "ocid1.instance'; then
+              echo "result=success" >> "$GITHUB_OUTPUT"; echo "LAUNCHED"; exit 0
+            fi
+            echo "attempt $i/9: $(printf '%s' "$OUT" | grep -oE 'Out of host capacity|Too many requests|TooManyRequests' | head -1)"
+            [ "$i" -lt 9 ] && sleep 60
+          done
+          echo "result=nocap" >> "$GITHUB_OUTPUT"; echo "no capacity this run"
+      - name: Announce success and stop scheduling
+        if: steps.r.outputs.result == 'success' || steps.r.outputs.result == 'exists'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "${{ github.repository }}" \
+            --title "✅ free-vm-2 is UP — Oracle capacity caught" \
+            --body "The Oracle free-tier A1 instance **free-vm-2** launched successfully (capacity was finally available). Get its public IP from the OCI Console (Compute → Instances → free-vm-2) or ask Claude to fetch it. Then TEAR DOWN: delete the OCI API key in the Console, and delete this repository/workflow." || true
+          gh workflow disable oci-a1-retry --repo "${{ github.repository }}" || true

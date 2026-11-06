@@ -30,7 +30,7 @@ jobs:
           chmod 600 ~/.oci/config
       - name: Install OCI CLI
         run: pip install -q oci-cli
-      - name: Retry launch (9 attempts, ~9 min)
+      - name: Retry launch (adaptive backoff, ~10 min)
         id: r
         env:
           SUPPRESS_LABEL_WARNING: "True"
@@ -41,8 +41,9 @@ jobs:
           AD="npHA:IL-JERUSALEM-1-AD-1"
           EXIST=$(oci compute instance list -c "$T" --query "length(data[?\"display-name\"=='free-vm-2' && \"lifecycle-state\"!='TERMINATED'])" --raw-output 2>/dev/null)
           if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then echo "result=exists" >> "$GITHUB_OUTPUT"; echo "free-vm-2 already exists"; exit 0; fi
-          for i in $(seq 1 9); do
-            OUT=$(oci compute instance launch \
+          for i in $(seq 1 8); do
+            # --no-retry => one single API call per attempt (no internal retries that burn the rate limit)
+            OUT=$(oci --no-retry compute instance launch \
               --availability-domain "$AD" --compartment-id "$T" \
               --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
               --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
@@ -50,8 +51,11 @@ jobs:
             if printf '%s' "$OUT" | grep -q '"id": "ocid1.instance'; then
               echo "result=success" >> "$GITHUB_OUTPUT"; echo "LAUNCHED"; exit 0
             fi
-            echo "attempt $i/9: $(printf '%s' "$OUT" | grep -oE 'Out of host capacity|Too many requests|TooManyRequests' | head -1)"
-            [ "$i" -lt 9 ] && sleep 60
+            R=$(printf '%s' "$OUT" | grep -oE 'Out of host capacity|Too many requests|TooManyRequests' | head -1)
+            echo "attempt $i/8: ${R:-unknown}"
+            # back off longer when throttled so the next attempt actually checks capacity
+            if printf '%s' "$R" | grep -qi 'too many'; then SLP=120; else SLP=75; fi
+            [ "$i" -lt 8 ] && sleep "$SLP"
           done
           echo "result=nocap" >> "$GITHUB_OUTPUT"; echo "no capacity this run"
       - name: Announce success and stop scheduling

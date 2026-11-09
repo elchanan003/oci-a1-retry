@@ -43,22 +43,35 @@ jobs:
           EXIST=$(oci compute instance list -c "$T" --query "length(data[?\"display-name\"=='free-vm-2' && \"lifecycle-state\"!='TERMINATED'])" --raw-output 2>/dev/null)
           if [ -n "$EXIST" ] && [ "$EXIST" != "0" ]; then echo "result=exists" >> "$GITHUB_OUTPUT"; echo "free-vm-2 already exists"; exit 0; fi
           END=$(( $(date +%s) + 20400 ))   # loop for ~5h40m, under GitHub's 6h job cap
+          # Try the full free shape first; if it's out of capacity, try a smaller
+          # slice that's easier for Oracle to schedule onto a partially-full host.
+          # Both boot the SAME 200GB volume (data intact); a 1-OCPU catch can be
+          # resized up to 2/12 afterwards (reboot, no disk change).
+          try_launch() {  # $1=ocpus $2=memGB -> prints oci output
+            oci --no-retry compute instance launch \
+              --availability-domain "$AD" --compartment-id "$T" \
+              --shape VM.Standard.A1.Flex --shape-config "{\"ocpus\":$1,\"memoryInGBs\":$2}" \
+              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
+              --subnet-id "$SUB" --assign-public-ip true --display-name free-vm-2 2>&1 || true
+          }
           i=0
           while [ "$(date +%s)" -lt "$END" ]; do
             i=$((i+1))
-            # --no-retry => one API call per attempt (no internal retries that burn the rate limit)
-            OUT=$(oci --no-retry compute instance launch \
-              --availability-domain "$AD" --compartment-id "$T" \
-              --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --source-details "{\"sourceType\":\"bootVolume\",\"bootVolumeId\":\"$BV\"}" \
-              --subnet-id "$SUB" --assign-public-ip true --display-name free-vm-2 2>&1 || true)
-            if printf '%s' "$OUT" | grep -q '"id": "ocid1.instance'; then
-              echo "result=success" >> "$GITHUB_OUTPUT"; echo "LAUNCHED after $i attempts"; exit 0
-            fi
-            R=$(printf '%s' "$OUT" | grep -oE 'Out of host capacity|Too many requests|TooManyRequests' | head -1)
-            echo "attempt $i ($(date -u +%H:%M:%S) UTC): ${R:-unknown}"
-            # back off longer when throttled so the next attempt actually checks capacity
-            if printf '%s' "$R" | grep -qi 'too many'; then sleep 120; else sleep 75; fi
+            THROTTLED=""
+            for SHAPE in "2 12" "1 6"; do
+              set -- $SHAPE
+              OUT=$(try_launch "$1" "$2")
+              if printf '%s' "$OUT" | grep -q '"id": "ocid1.instance'; then
+                echo "result=success" >> "$GITHUB_OUTPUT"
+                echo "shape=$1 OCPU / $2 GB" >> "$GITHUB_OUTPUT"
+                echo "LAUNCHED at $1 OCPU / $2 GB after $i rounds"; exit 0
+              fi
+              R=$(printf '%s' "$OUT" | grep -oE 'Out of host capacity|Too many requests|TooManyRequests' | head -1)
+              echo "round $i, shape ${1}/${2} ($(date -u +%H:%M:%S) UTC): ${R:-unknown}"
+              if printf '%s' "$R" | grep -qi 'too many'; then THROTTLED=1; break; fi
+            done
+            # back off longer when throttled so the next round actually checks capacity
+            if [ -n "$THROTTLED" ]; then sleep 120; else sleep 75; fi
           done
           echo "result=nocap" >> "$GITHUB_OUTPUT"; echo "no capacity in this ~5h40m window"
       - name: Announce success and stop scheduling
@@ -67,6 +80,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue create --repo "${{ github.repository }}" \
-            --title "✅ free-vm-2 is UP — Oracle capacity caught" \
-            --body "The Oracle free-tier A1 instance **free-vm-2** launched successfully (capacity was finally available). Get its public IP from the OCI Console (Compute → Instances → free-vm-2) or ask Claude to fetch it. Then TEAR DOWN: delete the OCI API key in the Console, and delete this repository/workflow." || true
+            --title "✅ free-vm-2 is UP — Oracle capacity caught (${{ steps.r.outputs.shape || 'existing' }})" \
+            --body "The Oracle free-tier A1 instance **free-vm-2** launched successfully (capacity was finally available). Caught at: **${{ steps.r.outputs.shape || 'already existed' }}**.
+
+If it was caught at **1 OCPU / 6 GB**, resize it up to the full free 2 OCPU / 12 GB once it's running (Console → free-vm-2 → Edit → change shape config; one reboot, boot volume/data untouched).
+
+Get its public IP from the OCI Console (Compute → Instances → free-vm-2) or ask Claude to fetch it. Then TEAR DOWN: delete the OCI API key in the Console, and delete this repository/workflow." || true
           gh workflow disable oci-a1-retry --repo "${{ github.repository }}" || true

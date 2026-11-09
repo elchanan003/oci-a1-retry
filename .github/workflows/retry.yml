@@ -78,12 +78,10 @@ jobs:
         if: steps.r.outputs.result == 'success' || steps.r.outputs.result == 'exists'
         env:
           GH_TOKEN: ${{ github.token }}
+          SHAPE: ${{ steps.r.outputs.shape || 'already existed' }}
         run: |
+          BODY=$'The Oracle free-tier A1 instance **free-vm-2** launched successfully (capacity was finally available). Caught at: **'"$SHAPE"$'**.\n\nIf it was caught at **1 OCPU / 6 GB**, resize it up to the full free 2 OCPU / 12 GB once it is running (Console \xe2\x86\x92 free-vm-2 \xe2\x86\x92 Edit \xe2\x86\x92 change shape config; one reboot, boot volume/data untouched).\n\nGet its public IP from the OCI Console (Compute \xe2\x86\x92 Instances \xe2\x86\x92 free-vm-2) or ask Claude to fetch it. Then TEAR DOWN: delete the OCI API key in the Console, and delete this repository/workflow.'
           gh issue create --repo "${{ github.repository }}" \
-            --title "✅ free-vm-2 is UP — Oracle capacity caught (${{ steps.r.outputs.shape || 'existing' }})" \
-            --body "The Oracle free-tier A1 instance **free-vm-2** launched successfully (capacity was finally available). Caught at: **${{ steps.r.outputs.shape || 'already existed' }}**.
-
-If it was caught at **1 OCPU / 6 GB**, resize it up to the full free 2 OCPU / 12 GB once it's running (Console → free-vm-2 → Edit → change shape config; one reboot, boot volume/data untouched).
-
-Get its public IP from the OCI Console (Compute → Instances → free-vm-2) or ask Claude to fetch it. Then TEAR DOWN: delete the OCI API key in the Console, and delete this repository/workflow." || true
+            --title "✅ free-vm-2 is UP — Oracle capacity caught ($SHAPE)" \
+            --body "$BODY" || true
           gh workflow disable oci-a1-retry --repo "${{ github.repository }}" || true
